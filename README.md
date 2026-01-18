@@ -1,40 +1,158 @@
-# Secure-Edge-Access-Implementation-via-Cloudflare-Tunnel-Zero-Trust-
-Date: January 19, 2026 Author: [Your Name/Username] Status: Phase 1 Completed (Router), Phase 2 Pending (Debian VPS)
-1. Abstract / 摘要This document outlines the deployment of Cloudflare Tunnel (formerly Argo Tunnel) to establish secure, encrypted ingress to a local edge device (GL.iNet BE3600 Router) running OpenWrt. The solution bypasses the need for Public IPs and port forwarding (CGNAT traversal) by establishing an outbound connection to Cloudflare's edge network.本文档记录了利用 Cloudflare Tunnel 在边缘设备（OpenWrt 路由器）上部署安全访问的方案。该方案通过建立出站加密隧道，绕过公网 IP 和端口映射限制（穿透 CGNAT），实现了对本地服务的 HTTPS 访问。2. Architectural Principle / 架构原理2.1 Traffic Flow / 流量走向The architecture utilizes a Reverse Tunneling mechanism. Unlike traditional VPNs, the local agent (cloudflared) initiates traffic outbound to Cloudflare, eliminating the need to open inbound firewall ports.Data Path:User Client $\rightarrow$ Internet (HTTPS) $\rightarrow$ Cloudflare Edge (SSL Termination) $\rightarrow$ QUIC Tunnel $\rightarrow$ Router (cloudflared) $\rightarrow$ Local Nginx (127.0.0.1:80)2.2 Security Model / 安全模型Zero Trust: The internal IP (192.168.8.1) is never exposed to the public internet.SSL Offloading: Cloudflare handles the SSL/TLS certificate management automatically.Authentication: The tunnel is authenticated via a unique Token generated in the Cloudflare Zero Trust Dashboard.3. Implementation Details: Phase 1 (Router) / 实施细节Device: GL.iNet GL-BE3600OS: OpenWrt 23.05-SNAPSHOT (Linux)Architecture: aarch64 (ARM64)3.1 Binary Installation / 二进制文件部署Due to the lack of a native package manager in the specific OpenWrt build, a manual binary installation was performed.由于该 OpenWrt 版本软件源限制，采用了手动下载二进制文件的方式安装。Bash# 1. Navigate to temporary directory / 进入临时目录
-cd /tmp
 
-# 2. Retrieve the ARM64 binary / 下载对应架构文件
+
+# Cloudflare Zero Trust 网络访问 (ZTNA) 实施方案
+
+![项目状态](https://img.shields.io/badge/状态-第一阶段%20完成-success)
+![支持平台](https://img.shields.io/badge/平台-OpenWrt%20%7C%20Debian-blue)
+![中间件](https://img.shields.io/badge/Cloudflare-隧道-orange)
+![开源协议](https://img.shields.io/badge/协议-MIT-green)
+
+## 1. 摘要
+
+本项目旨在记录 **Cloudflare Tunnel (cloudflared)** 的部署过程，以建立对本地基础设施的安全、加密入口，无需暴露公网 IP 地址或进行端口转发。主要目标是绕过 CGNAT（运营商级网络地址转换）的限制，并通过 Cloudflare 边缘网络保障本地管理界面的安全访问。
+
+本项目记录了利用 Cloudflare Tunnel 在本地基础设施上部署安全访问的方案。该方案通过建立出站加密隧道，绕过公网 IP 和端口映射限制（穿透 CGNAT），实现了对内网管理界面的 HTTPS 安全访问。
+
+---
+
+## 2. 网络拓扑
+
+该架构采用由本地代理发起的 **反向隧道** 机制。
+
+* **入口域名**: `https://router.yamic189.dpdns.org` (公网)
+* **隧道终端**: GL.iNet GL-BE3600 (本地代理)
+* **上游服务**: Nginx 服务于 `127.0.0.1:80`
+
+**数据流向**:
+`用户客户端` $\rightarrow$ `Cloudflare 边缘节点 (SSL 终止)` $\rightarrow$ `QUIC 协议` $\rightarrow$ `本地代理 (cloudflared)` $\rightarrow$ `本地服务:80`
+
+---
+
+## 3. 第一阶段：边缘路由器部署
+
+**设备规格**:
+* **型号**: GL.iNet GL-BE3600
+* **架构**: `aarch64` (ARM64)
+* **操作系统**: OpenWrt 23.05-SNAPSHOT
+
+### 3.1 二进制文件安装
+
+由于特定 OpenWrt 版本的软件源限制，我们通过 SSH 手动安装了二进制文件。
+
+```bash
+# 1. 将 ARM64 架构的二进制文件下载到临时目录
+cd /tmp
 wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64
 
-# 3. Relocate to system path and rename / 移动并重命名
+# 2. 将文件移动到系统可执行文件路径并重命名
 mv cloudflared-linux-arm64 /usr/bin/cloudflared
 
-# 4. Assign execution privileges / 赋予执行权限
+# 3. 赋予执行权限
 chmod +x /usr/bin/cloudflared
 
-# 5. Verification / 验证安装
+# 4. 验证安装版本
 cloudflared --version
-# Output: cloudflared version 2025.11.1 ...
-3.2 Service Persistence (init.d/rc.local) / 持久化运行Since OpenWrt utilizes procd (and rc.local for simple scripts) rather than systemd, we injected the startup command into /etc/rc.local.由于 OpenWrt 不使用 systemd，我们通过修改启动脚本实现开机自启。Script Injection:Bashcat <<EOF > /etc/rc.local
-# Cloudflare Tunnel Auto Start
-# Delay to ensure network stack is up / 延迟启动确保网络就绪
+# 预期输出: cloudflared version 2025.11.1...
+```
+
+### 3.2 服务持久化策略
+
+由于 OpenWrt 使用 procd/init.d 和 rc.local 而非 systemd，我们将启动逻辑注入到 `/etc/rc.local` 文件中。
+
+配置 (`/etc/rc.local`):
+
+```bash
+# 注入启动脚本
+cat <<EOF > /etc/rc.local
+# Cloudflare Tunnel 开机自启
+# 等待15秒以确保网络堆栈初始化完成
 sleep 15
-/usr/bin/cloudflared tunnel run --token <YOUR_TOKEN_HERE> > /dev/null 2>&1 &
+/usr/bin/cloudflared tunnel run --token <你的隧道令牌> > /dev/null 2>&1 &
 
 exit 0
 EOF
 
-# Grant permission / 赋予脚本执行权限
+# 赋予脚本执行权限
 chmod +x /etc/rc.local
-3.3 Configuration Parameters / 配置参数In the Cloudflare Zero Trust Dashboard:Public Hostname: router.yamic189.dpdns.orgService Type: HTTP (Crucial for avoiding SSL handshake loops)Target URL: 127.0.0.1:80Note: Using 127.0.0.1 is preferred over 192.168.8.1 to eliminate routing complexity within the device.注： 指向 127.0.0.1 比内网 IP 更稳定，因为这是回环地址，直接指向本机服务。4. Troubleshooting Log / 故障排查记录Issue: Error 1033 (Tunnel Error)Symptom: User received Cloudflare Error 1033 when accessing the domain.Cause Analysis:Configuration Mismatch: The tunnel was originally pointing to https://192.168.8.1:443. The router's self-signed certificate was rejected by Cloudflare, or the port was unreachable.Process Termination: The cloudflared process was terminated (SIGINT) and not running in the background.Resolution:Changed Service Type to HTTP and Target to 80.Implemented the rc.local script to ensure the daemon runs in the background (&).Verified local service availability via curl -I http://127.0.0.1:80.5. Phase 2: Debian Server Roadmap / 下一阶段规划Target: RackNerd VPS (Debian 13)Goal: Integrate the VPS into the same Cloudflare account but isolate it as a separate "Public Hostname" or separate Tunnel.目标： 将 Debian 服务器接入同个账号，但通过不同子域名访问。5.1 Recommended Strategy / 推荐策略Unlike the Router (which uses rc.local), Debian 13 uses systemd, which allows for a more robust "Service Mode" installation.Debian 13 支持 systemd，因此我们将采用官方推荐的“服务模式”安装，比路由器的脚本方式更稳定。5.2 Implementation Plan / 实施计划Create a New Tunnel (Optional but Recommended):Create a tunnel named RackNerd-VPS to separate "Home" and "Cloud" infrastructure.Why? If the router goes offline, the VPS status remains "Healthy".Installation on Debian:Bash# Step 1: Add Cloudflare GPG key / 添加签名
+```
+
+**安全提示**: 出于安全考虑，实际的隧道令牌 (Token) 已从本文档中移除。部署时，请将其替换为你的真实令牌。
+
+## 4. 事件报告与故障排查
+
+**事件**: 错误 1033 (隧道错误)
+**描述**: 首次连接时，浏览器返回 Cloudflare 错误 1033。
+
+**根本原因分析 (RCA)**:
+
+1.  **协议不匹配**: 隧道被配置为将流量转发到 `https://192.168.8.1:443`。路由器自签名的 SSL 证书导致了握手失败。
+2.  **进程终止**: `cloudflared` 进程被手动终止，并未在后台持续运行。
+
+**解决方案**:
+
+1.  **配置更新**: 修改 Cloudflare 控制面板中的设置：
+    *   服务类型: HTTP (从 HTTPS 修改)
+    *   URL: `127.0.0.1:80` (从 `192.168.8.1` 修改)
+2.  **后台运行**: 实现了 `rc.local` 脚本，并通过 `&` 符号确保进程在后台运行。
+3.  **服务验证**: 使用 `curl -I http://127.0.0.1:80` 命令验证了本地服务的可访问性。
+
+## 5. 第二阶段：VPS 集成路线图
+
+**目标**: 将一台 RackNerd VPS (Debian 13) 作为独立端点集成到同一个 Zero Trust 网络中。
+
+**计划实施方案**:
+
+*   **安装方式**: 使用原生包管理器 (`apt`) 和 Systemd 服务。
+*   **主机名**: `vps.yamic189.dpdns.org`
+
+**命令预览**:
+
+```bash
 curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-
-# Step 2: Add Repo / 添加源
 echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared bookworm main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
-
-# Step 3: Install / 安装
 sudo apt-get update && sudo apt-get install cloudflared
+```
 
-# Step 4: Register Service / 注册系统服务
-sudo cloudflared service install <NEW_VPS_TOKEN>
-Domain Binding:Bind vps.yamic189.dpdns.org (or a specific app subdomain) to localhost:PORT.Next Action: Proceed with Phase 2 on the Debian 13 server.下一步： 开始在 Debian 13 服务器上部署。既然你已经整理好文档，下一步我们做 RackNerd 服务器吗？在 Debian 13 上，我们不需要像在路由器上那样手动改脚本，可以使用更高级的 Systemd 服务 模式。如果你准备好了，请登录你的 Debian 服务器，输入以下命令告诉我结果（确认架构）：uname -m && cat /etc/debian_version
+## 附录：仓库配置说明
+
+为保持仓库的整洁与安全，我们应用了以下配置。
+
+### A. .gitignore 配置
+
+创建一个 `.gitignore` 文件以防止敏感数据泄露。
+
+```gitignore
+# 安全：永远不要提交凭证信息
+*.token
+*.key
+*.pem
+.env
+id_rsa
+
+# 系统日志
+*.log
+/tmp/
+cf.log
+
+# 系统元数据
+.DS_Store
+Thumbs.db
+```
+
+### B. 开源协议
+
+本项目采用 MIT 开源协议。
+
+```plaintext
+MIT License
+
+Copyright (c) 2026 [你的名字]
+
+特此免费授予任何获得本软件副本及相关文档文件（“软件”）的人不受限制地处理本软件的权利，包括但不限于使用、复制、修改、合并、发布、分发、再许可和/或销售软件副本的权利，并允许获得软件的人这样做，但须符合以下条件：
+
+上述版权声明和本许可声明应包含在软件的所有副本或实质性部分中。
+
+本软件按“原样”提供，不提供任何形式的明示或暗示的保证，包括但不限于对适销性、特定用途的适用性和非侵权性的保证。在任何情况下，作者或版权持有人均不对因软件或软件的使用或其他交易而产生的任何索赔、损害或其他责任承担责任，无论是在合同、侵权还是其他方面。
+
+(完整协议请参见 LICENSE 文件)
+```
